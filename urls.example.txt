@@ -1,0 +1,4 @@
+# One TikTok video URL per line. Supports full /video/<id> URLs and vm.tiktok.com short links.
+# Up to 80 URLs.
+https://www.tiktok.com/@scout2015/video/6718335390845095173
+https://www.tiktok.com/@charlidamelio/video/7104184325942185262
