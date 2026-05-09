@@ -1,5 +1,6 @@
 {
-  "sessionid": "PASTE_YOUR_TIKTOK_SESSIONID_COOKIE_HERE",
+  "sessionid": "PASTE_YOUR_TIKTOK_sessionid_COOKIE_HERE_OR_USE_sid_guard_BELOW",
+  "sid_guard": "OPTIONAL: paste the full sid_guard cookie if you cannot find sessionid",
   "msToken": "OPTIONAL_msToken_COOKIE",
   "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
   "proxy": null

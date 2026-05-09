@@ -72,17 +72,36 @@ class Config:
                 f"Config file {path} not found. See config.example.json."
             )
         data = json.loads(path.read_text(encoding="utf-8"))
-        sessionid = data.get("sessionid", "").strip()
-        if not sessionid:
+        raw_sessionid = (
+            data.get("sessionid")
+            or data.get("sid_guard")
+            or ""
+        ).strip()
+        if not raw_sessionid:
             raise SystemExit(
-                "config.json must include a non-empty 'sessionid' value."
+                "config.json must include a non-empty 'sessionid' (or "
+                "'sid_guard') value."
             )
+        sessionid = normalize_sessionid(raw_sessionid)
         return cls(
             sessionid=sessionid,
             msToken=data.get("msToken") or None,
             user_agent=data.get("user_agent") or DEFAULT_USER_AGENT,
             proxy=data.get("proxy") or None,
         )
+
+
+def normalize_sessionid(value: str) -> str:
+    """Accept either a plain ``sessionid`` or a ``sid_guard`` cookie value.
+
+    TikTok's ``sid_guard`` cookie embeds the sessionid as the first ``|``-
+    separated field (URL-encoded as ``%7C``). The remaining fields are the
+    creation timestamp, lifetime, and human-readable expiry. Strip them so
+    the user can paste either form.
+    """
+    decoded = value.replace("%7C", "|").replace("%7c", "|")
+    head = decoded.split("|", 1)[0].strip()
+    return head or value.strip()
 
 
 @dataclass(frozen=True)

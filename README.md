@@ -41,6 +41,24 @@ pip install -r requirements.txt
 `msToken` and `proxy` are optional. If you hit a lot of rate limits, set
 `proxy` to something like `http://user:pass@host:port`.
 
+### If you only see `sid_guard`, not `sessionid`
+
+Some browsers / extensions only expose the `sid_guard` cookie. Its value
+looks like:
+
+```
+3406cf0ff78ba0b0a805099101cc074f%7C1776664361%7C15552000%7C...
+```
+
+You can either:
+
+- Paste the **whole** value as the `sid_guard` field in `config.json` — the
+  script will automatically strip the trailing metadata; or
+- Manually take only the part **before the first `%7C`** and paste it as
+  `sessionid`.
+
+Both forms work.
+
 ## Run
 
 ```bash
