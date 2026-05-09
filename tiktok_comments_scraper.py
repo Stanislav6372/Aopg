@@ -1,54 +1,48 @@
 """TikTok comments scraper.
 
 Reads a list of TikTok video URLs (one per line) from an input file, fetches
-all comments for each video using the public TikTok web API, and writes the
-results to ``comments_output.csv``.
+all comments for each video, and writes the results to ``comments_output.csv``.
 
-Usage:
+Authentication is performed via cookies provided in ``config.json``. The
+script uses the `TikTokApi <https://github.com/davidteather/TikTok-Api>`_
+library, which drives a headless Chromium via Playwright. This is required
+because TikTok signs every web API request from JS in the browser, so a
+plain ``httpx`` client cannot fetch comments without that signing.
+
+Usage::
+
     python tiktok_comments_scraper.py urls.txt
 
-Configuration:
-    A ``config.json`` file in the working directory must provide the
-    ``sessionid`` cookie copied from a logged-in browser session. Optional
-    fields are documented in ``config.example.json``.
-
-The script is intentionally conservative: it sleeps a random 3-8 seconds
-between paginated requests, retries failed requests with exponential backoff,
-and prints progress for every video.
+See ``README.md`` for the full setup procedure (Playwright install, cookies,
+etc.).
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import csv
 import json
 import logging
 import random
 import re
 import sys
-import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Iterable
 
-import httpx
+from TikTokApi import TikTokApi
 
 LOGGER = logging.getLogger("tiktok_scraper")
 
 DEFAULT_CONFIG_PATH = Path("config.json")
 DEFAULT_OUTPUT_PATH = Path("comments_output.csv")
-COMMENT_API_URL = "https://www.tiktok.com/api/comment/list/"
-PAGE_SIZE = 20
 MAX_URLS = 80
-MAX_RETRIES = 4
+MAX_COMMENTS_PER_VIDEO = 10_000
+MAX_RETRIES = 3
 MIN_DELAY = 3.0
 MAX_DELAY = 8.0
-
-DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
 
 VIDEO_ID_PATTERNS = (
     re.compile(r"/video/(\d+)"),
@@ -61,8 +55,8 @@ VIDEO_ID_PATTERNS = (
 @dataclass(frozen=True)
 class Config:
     sessionid: str
-    msToken: str | None = None
-    user_agent: str = DEFAULT_USER_AGENT
+    msToken: str
+    headless: bool = True
     proxy: str | None = None
 
     @classmethod
@@ -83,22 +77,23 @@ class Config:
                 "'sid_guard') value."
             )
         sessionid = normalize_sessionid(raw_sessionid)
+        ms_token = (data.get("msToken") or "").strip()
+        if not ms_token:
+            raise SystemExit(
+                "config.json must include a non-empty 'msToken' value. "
+                "Copy it from the .tiktok.com cookies in your browser."
+            )
+        headless_flag = data.get("headless")
         return cls(
             sessionid=sessionid,
-            msToken=data.get("msToken") or None,
-            user_agent=data.get("user_agent") or DEFAULT_USER_AGENT,
+            msToken=ms_token,
+            headless=True if headless_flag is None else bool(headless_flag),
             proxy=data.get("proxy") or None,
         )
 
 
 def normalize_sessionid(value: str) -> str:
-    """Accept either a plain ``sessionid`` or a ``sid_guard`` cookie value.
-
-    TikTok's ``sid_guard`` cookie embeds the sessionid as the first ``|``-
-    separated field (URL-encoded as ``%7C``). The remaining fields are the
-    creation timestamp, lifetime, and human-readable expiry. Strip them so
-    the user can paste either form.
-    """
+    """Accept either a plain ``sessionid`` or a ``sid_guard`` cookie value."""
     decoded = value.replace("%7C", "|").replace("%7c", "|")
     head = decoded.split("|", 1)[0].strip()
     return head or value.strip()
@@ -114,22 +109,11 @@ class CommentRow:
 
 
 def extract_video_id(url: str) -> str | None:
-    """Extract the numeric video id from a TikTok URL."""
     for pattern in VIDEO_ID_PATTERNS:
         match = pattern.search(url)
         if match:
             return match.group(1)
     return None
-
-
-def resolve_short_url(client: httpx.Client, url: str) -> str:
-    """Follow redirects for vm.tiktok.com / vt.tiktok.com short links."""
-    try:
-        response = client.get(url, follow_redirects=True, timeout=15.0)
-        return str(response.url)
-    except httpx.HTTPError as exc:
-        LOGGER.warning("Failed to resolve short URL %s: %s", url, exc)
-        return url
 
 
 def read_urls(path: Path) -> list[str]:
@@ -150,79 +134,47 @@ def read_urls(path: Path) -> list[str]:
     return urls
 
 
-def build_client(config: Config) -> httpx.Client:
-    headers = {
-        "User-Agent": config.user_agent,
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.tiktok.com/",
-        "Origin": "https://www.tiktok.com",
-    }
-    cookies = {"sessionid": config.sessionid}
-    if config.msToken:
-        cookies["msToken"] = config.msToken
-    return httpx.Client(
-        headers=headers,
-        cookies=cookies,
-        timeout=20.0,
-        proxy=config.proxy,
-        follow_redirects=True,
-    )
+def build_cookie_payload(config: Config) -> list[dict[str, object]]:
+    """Build the cookies list passed to ``TikTokApi.create_sessions``."""
+    return [
+        {
+            "name": "sessionid",
+            "value": config.sessionid,
+            "domain": ".tiktok.com",
+            "path": "/",
+        }
+    ]
 
 
-def random_delay() -> None:
+async def random_delay() -> None:
     delay = random.uniform(MIN_DELAY, MAX_DELAY)
     LOGGER.debug("Sleeping %.2fs", delay)
-    time.sleep(delay)
+    await asyncio.sleep(delay)
 
 
-def fetch_with_retries(
-    client: httpx.Client, params: dict[str, str | int]
-) -> dict:
-    """GET the comment list endpoint with retry + exponential backoff."""
-    last_exc: Exception | None = None
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            response = client.get(COMMENT_API_URL, params=params)
-            if response.status_code == 200:
-                # TikTok occasionally returns an empty body on rate limits.
-                if not response.content:
-                    raise httpx.HTTPError("Empty response body")
-                return response.json()
-            if response.status_code in (403, 429) or response.status_code >= 500:
-                raise httpx.HTTPError(
-                    f"HTTP {response.status_code} from TikTok"
-                )
-            response.raise_for_status()
-        except (httpx.HTTPError, json.JSONDecodeError) as exc:
-            last_exc = exc
-            backoff = min(60.0, (2 ** attempt) + random.uniform(0, 1.5))
-            LOGGER.warning(
-                "Request failed (attempt %d/%d): %s. Sleeping %.1fs",
-                attempt,
-                MAX_RETRIES,
-                exc,
-                backoff,
-            )
-            time.sleep(backoff)
-    raise RuntimeError(f"Giving up after {MAX_RETRIES} retries: {last_exc}")
+def parse_create_time(raw: object) -> str:
+    if not raw:
+        return ""
+    try:
+        return datetime.fromtimestamp(int(raw), tz=timezone.utc).isoformat()
+    except (TypeError, ValueError):
+        return ""
 
 
-def parse_comment(item: dict, video_url: str) -> CommentRow:
-    user = item.get("user") or {}
+def comment_to_row(comment: object, video_url: str) -> CommentRow:
+    data = getattr(comment, "as_dict", {}) or {}
+    user = data.get("user") or {}
     username = (
         user.get("unique_id")
         or user.get("nickname")
-        or user.get("sec_uid")
+        or getattr(getattr(comment, "author", None), "username", "")
         or ""
     )
-    text = item.get("text") or ""
-    likes = int(item.get("digg_count") or 0)
-    create_time = item.get("create_time")
-    if create_time:
-        date = datetime.fromtimestamp(int(create_time), tz=timezone.utc).isoformat()
-    else:
-        date = ""
+    text = getattr(comment, "text", None) or data.get("text") or ""
+    likes = int(
+        getattr(comment, "likes_count", None) or data.get("digg_count") or 0
+    )
+    date = parse_create_time(data.get("create_time"))
     return CommentRow(
         video_url=video_url,
         username=username,
@@ -232,32 +184,66 @@ def parse_comment(item: dict, video_url: str) -> CommentRow:
     )
 
 
-def iter_comments(
-    client: httpx.Client, video_id: str, video_url: str
-) -> Iterator[CommentRow]:
-    cursor = 0
-    total_seen = 0
-    while True:
-        params = {
-            "aweme_id": video_id,
-            "count": PAGE_SIZE,
-            "cursor": cursor,
-            "aid": 1988,
-            "app_language": "en",
-            "device_platform": "web_pc",
-        }
-        payload = fetch_with_retries(client, params)
-        comments = payload.get("comments") or []
-        for item in comments:
-            yield parse_comment(item, video_url)
-        total_seen += len(comments)
-        has_more = bool(payload.get("has_more"))
-        next_cursor = payload.get("cursor")
-        if not has_more or next_cursor in (None, cursor):
-            LOGGER.info("Fetched %d comments for %s", total_seen, video_id)
-            return
-        cursor = int(next_cursor)
-        random_delay()
+async def fetch_video_comments(
+    api: TikTokApi, raw_url: str
+) -> tuple[list[CommentRow], str | None]:
+    """Return (rows, error). ``error`` is None on success."""
+    video_id = extract_video_id(raw_url)
+    if not video_id:
+        return [], f"Could not parse video id from {raw_url}"
+    last_error: str | None = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            video = api.video(id=video_id, url=raw_url)
+            rows: list[CommentRow] = []
+            async for comment in video.comments(count=MAX_COMMENTS_PER_VIDEO):
+                rows.append(comment_to_row(comment, raw_url))
+            return rows, None
+        except Exception as exc:  # noqa: BLE001 - we want to retry on anything
+            last_error = f"{type(exc).__name__}: {exc}"
+            backoff = min(60.0, (2 ** attempt) + random.uniform(0, 1.5))
+            LOGGER.warning(
+                "Attempt %d/%d for %s failed: %s. Sleeping %.1fs",
+                attempt,
+                MAX_RETRIES,
+                raw_url,
+                last_error,
+                backoff,
+            )
+            await asyncio.sleep(backoff)
+    return [], last_error
+
+
+async def collect(
+    urls: list[str], config: Config
+) -> tuple[list[CommentRow], list[str]]:
+    rows: list[CommentRow] = []
+    failures: list[str] = []
+    proxies = [config.proxy] if config.proxy else None
+    async with TikTokApi() as api:
+        await api.create_sessions(
+            ms_tokens=[config.msToken],
+            num_sessions=1,
+            sleep_after=3,
+            headless=config.headless,
+            cookies=build_cookie_payload(config),
+            proxies=proxies,
+        )
+        for index, raw_url in enumerate(urls, start=1):
+            print(
+                f"[{index}/{len(urls)}] Fetching comments for {raw_url}",
+                flush=True,
+            )
+            video_rows, error = await fetch_video_comments(api, raw_url)
+            if error:
+                LOGGER.error("Failed %s: %s", raw_url, error)
+                failures.append(raw_url)
+            else:
+                print(f"    -> {len(video_rows)} comments", flush=True)
+                rows.extend(video_rows)
+            if index < len(urls):
+                await random_delay()
+    return rows, failures
 
 
 def write_csv(rows: Iterable[CommentRow], path: Path) -> int:
@@ -271,40 +257,6 @@ def write_csv(rows: Iterable[CommentRow], path: Path) -> int:
             )
             count += 1
     return count
-
-
-def collect(
-    urls: list[str], config: Config, output: Path
-) -> tuple[int, list[str]]:
-    failures: list[str] = []
-    rows: list[CommentRow] = []
-    with build_client(config) as client:
-        for index, raw_url in enumerate(urls, start=1):
-            url = raw_url
-            if "vm.tiktok.com" in url or "vt.tiktok.com" in url:
-                url = resolve_short_url(client, url)
-            video_id = extract_video_id(url)
-            if not video_id:
-                LOGGER.error("[%d/%d] Could not parse video id from %s",
-                             index, len(urls), raw_url)
-                failures.append(raw_url)
-                continue
-            print(
-                f"[{index}/{len(urls)}] Fetching comments for {url}",
-                flush=True,
-            )
-            try:
-                video_rows = list(iter_comments(client, video_id, url))
-            except Exception as exc:  # noqa: BLE001 - surface any error per video
-                LOGGER.error("Failed to fetch %s: %s", url, exc)
-                failures.append(raw_url)
-                continue
-            rows.extend(video_rows)
-            print(f"    -> {len(video_rows)} comments", flush=True)
-            if index < len(urls):
-                random_delay()
-    written = write_csv(rows, output)
-    return written, failures
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -332,16 +284,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv if argv is not None else sys.argv[1:])
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
+async def amain(args: argparse.Namespace) -> int:
     config = Config.load(args.config)
     urls = read_urls(args.input)
     print(f"Loaded {len(urls)} URLs from {args.input}", flush=True)
-    written, failures = collect(urls, config, args.output)
+    rows, failures = await collect(urls, config)
+    written = write_csv(rows, args.output)
     print(f"Wrote {written} comments to {args.output}", flush=True)
     if failures:
         print(f"Failed videos ({len(failures)}):", flush=True)
@@ -349,6 +297,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  - {url}", flush=True)
         return 1
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv if argv is not None else sys.argv[1:])
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+    return asyncio.run(amain(args))
 
 
 if __name__ == "__main__":
